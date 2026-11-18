@@ -5,7 +5,7 @@ import contextlib
 import enum
 import logging
 import struct
-from typing import Iterator, Optional, Union, cast
+from typing import FrozenSet, Iterator, Optional, Union, cast
 
 from volatility3.framework import constants, exceptions, interfaces, objects
 from volatility3.framework.layers import registry
@@ -13,6 +13,18 @@ from volatility3.framework.layers import registry
 vollog = logging.getLogger(__name__)
 
 BIG_DATA_MAXLEN = 0x3FD8
+
+# Healthy hives nest at most a handful of index levels (ri -> ri -> lh) and
+# key depths measured in the dozens, so a structure crossing these bounds is
+# looping (self references or cycles) or was crafted to exhaust the
+# interpreter stack.  Both limits keep traversal bounded without truncating
+# any key that a real hive can produce.
+MAX_KEY_INDEX_DEPTH = 64
+MAX_KEY_PATH_DEPTH = 128
+
+# Prepended to a key path whose parent chain looped or ran too deep, so that
+# the partial result on its own cannot be mistaken for a complete path.
+KEY_PATH_TRUNCATION_MARKER = "[Truncated]"
 
 
 class RegValueTypes(enum.Enum):
@@ -191,12 +203,32 @@ class CM_KEY_NODE(objects.StructType):
             yield from self._get_subkeys_recursive(hive, subkey_node)
 
     def _get_subkeys_recursive(
-        self, hive: "registry.RegistryHive", node: interfaces.objects.ObjectInterface
+        self,
+        hive: "registry.RegistryHive",
+        node: interfaces.objects.ObjectInterface,
+        seen: Optional[FrozenSet[int]] = None,
+        depth: int = 0,
     ) -> Iterator["CM_KEY_NODE"]:
-        """Recursively descend a node returning subkeys."""
+        """Recursively descend a node returning subkeys.
+
+        Index cells can reference themselves or form cycles, either through
+        corruption or deliberately crafted structures, so each index node is
+        descended into at most once and the descent is capped.  Without those
+        two guards a cycle recurses until the interpreter stack is exhausted,
+        and a RecursionError is not a RegistryException, so it escapes every
+        caller's error handling.
+
+        Args:
+            hive: The registry hive the nodes belong to
+            node: The index (or key) node to descend
+            seen: Offsets of the index nodes already descended into
+            depth: Number of index levels descended so far
+        """
         # The keylist appears to include 4 bytes of key name after each value
         # We can either double the list and only use the even items, or
         # We could change the array type to a struct with both parts
+        if seen is None:
+            seen = frozenset()
         try:
             signature = node.cast("string", max_length=2, encoding="latin-1")
         except (
@@ -218,6 +250,19 @@ class CM_KEY_NODE(objects.StructType):
             )
 
         if listjump:
+            node_offset = node.vol.offset
+            if node_offset in seen:
+                vollog.debug(
+                    f"Loop detected in the key index at {hex(node_offset)}, not descending any further"
+                )
+                return None
+            if depth >= MAX_KEY_INDEX_DEPTH:
+                vollog.debug(
+                    f"Key index at {hex(node_offset)} exceeds the maximum index depth "
+                    f"of {MAX_KEY_INDEX_DEPTH}, not descending any further"
+                )
+                return None
+            seen = seen | {node_offset}
             node.List.count = node.Count * listjump
             for subnode_offset in node.List[::listjump]:
                 if (subnode_offset & 0x7FFFFFFF) > hive.maximum_address:
@@ -237,7 +282,9 @@ class CM_KEY_NODE(objects.StructType):
                             f"Failed to get node at {hex(subnode_offset)}, skipping",
                         )
                         continue
-                    yield from self._get_subkeys_recursive(hive, subnode)
+                    yield from self._get_subkeys_recursive(
+                        hive, subnode, seen=seen, depth=depth + 1
+                    )
 
     def get_values(self) -> Iterator["CM_KEY_VALUE"]:
         """Returns a list of the Value nodes for a key.
@@ -279,6 +326,14 @@ class CM_KEY_NODE(objects.StructType):
         """
         Returns the full path to this registry key.
 
+        The parent chain is walked with a seen set and a depth cap, matching
+        the loop protection used by CM_KEY_BODY.get_full_key_name.  A crafted
+        or corrupt hive can point a key at itself (or build a parent cycle),
+        which would otherwise recurse until the interpreter stack is
+        exhausted.  A looping chain is cut off and the partial path is
+        returned with KEY_PATH_TRUNCATION_MARKER in place of the missing
+        ancestors, so the caller still gets a string it can display.
+
         Raises TypeError if the key was not instantiated on a RegistryHive layer
         """
         reg = self._context.layers[self.vol.layer_name]
@@ -286,10 +341,27 @@ class CM_KEY_NODE(objects.StructType):
             raise TypeError("Key was not instantiated on a RegistryHive layer")
         # Using the offset adds a significant delay (since it cannot be cached easily)
         # if self.vol.offset == reg.get_node(reg.root_cell_offset).vol.offset:
-        if self.vol.offset == reg.root_cell_offset + 4:
-            # return the last part of the hive name for the root entry
-            return reg.get_name().split("\\")[-1]
-        return reg.get_node(self.Parent).get_key_path() + "\\" + self.get_name()
+        root_offset = reg.root_cell_offset + 4
+        names = []
+        seen = set()
+        node = self
+        while True:
+            node_offset = node.vol.offset
+            if node_offset == root_offset:
+                # The hive name takes the place of the root entry's own name
+                names.append(reg.get_name().split("\\")[-1])
+                break
+            if node_offset in seen or len(names) >= MAX_KEY_PATH_DEPTH:
+                vollog.debug(
+                    f"Loop detected walking the parent chain at {hex(node_offset)}, "
+                    f"truncating the key path after {len(names)} levels"
+                )
+                names.append(KEY_PATH_TRUNCATION_MARKER)
+                break
+            seen.add(node_offset)
+            names.append(node.get_name())
+            node = reg.get_node(node.Parent)
+        return "\\".join(reversed(names))
 
 
 class CM_KEY_VALUE(objects.StructType):

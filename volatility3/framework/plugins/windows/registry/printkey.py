@@ -20,7 +20,7 @@ class PrintKey(interfaces.plugins.PluginInterface):
     """Lists the registry keys under a hive or specific key value."""
 
     _required_framework_version = (2, 0, 0)
-    _version = (1, 1, 0)
+    _version = (1, 1, 1)
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -107,6 +107,14 @@ class PrintKey(interfaces.plugins.PluginInterface):
 
             if recurse:
                 if key_node.vol.offset not in [x.vol.offset for x in node_path]:
+                    if len(node_path) >= registry.MAX_KEY_PATH_DEPTH:
+                        vollog.debug(
+                            "Registry key tree exceeds the maximum depth of "
+                            f"{registry.MAX_KEY_PATH_DEPTH}, not recursing below "
+                            f"{key_path}"
+                        )
+                        continue
+
                     try:
                         key_node.get_name()
                     except (
@@ -280,6 +288,7 @@ class PrintKey(interfaces.plugins.PluginInterface):
             except (
                 exceptions.InvalidAddressException,
                 KeyError,
+                RecursionError,
                 registry_layer.RegistryException,
             ) as excp:
                 if isinstance(excp, KeyError):
@@ -288,6 +297,18 @@ class PrintKey(interfaces.plugins.PluginInterface):
                     )
                 elif isinstance(excp, registry_layer.RegistryException):
                     vollog.debug(excp)
+                elif isinstance(excp, RecursionError):
+                    # RecursionError derives from RuntimeError, not from
+                    # exceptions.VolatilityException, so it is not covered by
+                    # the registry exception hierarchy.  The traversal
+                    # routines guard against loops themselves, but should a
+                    # malformed hive still recurse too deeply, the failure
+                    # must stay scoped to this hive instead of unwinding out
+                    # of the generator and aborting the whole plugin run.
+                    vollog.debug(
+                        f"Registry structure in hive at offset {hex(hive.hive_offset)} "
+                        "recurses too deeply, skipping the remainder of the hive"
+                    )
                 elif isinstance(excp, exceptions.InvalidAddressException):
                     vollog.debug(
                         f"Invalid address identified in Hive: {hex(excp.invalid_address)}"
